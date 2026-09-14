@@ -119,18 +119,54 @@ class ClearCLIPVisualEncoder:
         if not self.cfg.drop_ffn:
             x_visual = x_visual + block.mlp(block.ln_2(x_visual))
 
-        # (N*heads, L, L) -> average over heads -> (N, L, L)
+        # (N*heads, L, L) -> average over heads -> (N, L, L). Two views are
+        # kept because Phase 1 (diagnostics) and Phase 2 Method B
+        # (calibration) need different stages of the same computation:
+        #   attn_weights_avg — POST-softmax, rows sum to 1 -> the diagnostic's
+        #                      c_i = sum_j A_ij*(1-r_j) weighted-average needs this.
+        #   sim_avg          — PRE-softmax (already /sqrt(head_dim)) -> Method B
+        #                      re-does softmax_j(sim/tau + position_bias), which
+        #                      requires starting from logits, not probabilities.
         attn_weights_avg = attn_weights.reshape(N, num_heads, L, L).mean(dim=1)
+        sim_avg = sim.reshape(N, num_heads, L, L).mean(dim=1)
 
-        return x_visual, attn_weights_avg
+        # (N*heads, L, head_dim) -> merge heads back to (N, L, embed_dim).
+        # This is the value vector Method B needs to re-apply a *different*
+        # attention matrix to (out = attn_weights' @ v); note it operates in
+        # the head-merged space (see calibration.py's Method B docstring for
+        # why this is a documented approximation, not an exact per-head redo).
+        v_merged = v.transpose(0, 1).reshape(L, N, embed_dim).transpose(0, 1)
+
+        return x_visual, attn_weights_avg, sim_avg, v_merged
+
+    def shared_params(self) -> dict:
+        """Post-last-attention parameters Method B needs to redo ln_post ->
+        visual.proj -> normalize from a *recomputed* attn output. Shared
+        across every image for a fixed backbone/checkpoint, so callers cache
+        this once (see run.py's `_shared.npz`), not per image.
+        """
+        visual = self.model.visual
+        block = self.resblocks[-1]
+        return {
+            "out_proj_weight": block.attn.out_proj.weight.detach().cpu().numpy(),
+            "out_proj_bias": block.attn.out_proj.bias.detach().cpu().numpy(),
+            "ln_post_weight": visual.ln_post.weight.detach().cpu().numpy(),
+            "ln_post_bias": visual.ln_post.bias.detach().cpu().numpy(),
+            "ln_post_eps": float(visual.ln_post.eps),
+            "visual_proj": visual.proj.detach().cpu().numpy(),
+        }
 
     @torch.no_grad()
     def encode_image_dense(self, pixel_values: torch.Tensor):
-        """Returns (patch_embeds, grid_h, grid_w, last_attn_weights).
+        """Returns (patch_embeds, grid_h, grid_w, patch_attn, patch_sim, v_patches).
 
         patch_embeds: (n_patches, d) L2-normalized, CLS token dropped.
-        last_attn_weights: (n_heads, n_patches, n_patches) averaged handled by
-            caller; kept per-head here for the Phase-1 centrality diagnostic.
+        patch_attn:   (n_patches, n_patches) POST-softmax, head-averaged —
+                      Phase-1 diagnostics (attention_centrality).
+        patch_sim:    (n_patches, n_patches) PRE-softmax, head-averaged —
+                      Phase-2 Method B re-derives its own softmax from this.
+        v_patches:    (n_patches, embed_dim) head-merged value vectors,
+                      pre-out_proj — Method B's `A' @ v_patches` input.
         """
         visual = self.model.visual
         x = pixel_values.to(self.device)
@@ -153,7 +189,7 @@ class ClearCLIPVisualEncoder:
         for block in self.resblocks[:-1]:
             x = block(x)
 
-        x_last, attn_weights = self._last_block_forward(x, self.resblocks[-1])
+        x_last, attn_weights, sim, v_merged = self._last_block_forward(x, self.resblocks[-1])
         x_last = x_last.permute(1, 0, 2)  # -> (N, L, D)
 
         patch_tokens = x_last[:, 1:, :]  # drop CLS position, keep spatial patches
@@ -162,18 +198,23 @@ class ClearCLIPVisualEncoder:
             patch_tokens = patch_tokens @ visual.proj
 
         patch_embeds = F.normalize(patch_tokens, dim=-1).squeeze(0)
-        # drop CLS row/col so caller gets a pure patch-to-patch attention map
+        # drop CLS row/col/token so callers get pure patch-to-patch tensors
         patch_attn = attn_weights[:, 1:, 1:].squeeze(0)
-        return patch_embeds, grid_h, grid_w, patch_attn
+        patch_sim = sim[:, 1:, 1:].squeeze(0)
+        v_patches = v_merged[:, 1:, :].squeeze(0)
+        return patch_embeds, grid_h, grid_w, patch_attn, patch_sim, v_patches
 
     @torch.no_grad()
     def dense_logits(self, pixel_values: torch.Tensor, text_embeds: torch.Tensor):
-        """Returns (logits, grid_h, grid_w, patch_attn). logits: (n_patches,
-        n_classes) cosine similarity, NOT yet temperature-scaled —
-        calibration.py applies the position-conditioned temperature on top of
-        this. patch_attn: (n_patches, n_patches) head-averaged self-self
-        attention, kept for the Phase-1 attention-centrality diagnostic.
+        """Returns (logits, grid_h, grid_w, patch_attn, patch_sim, v_patches).
+        logits: (n_patches, n_classes) cosine similarity, NOT yet calibrated —
+        calibration.py's Method A mixes each patch's logits with an
+        attention-weighted average of the rest (position-conditioned) on top
+        of `logits`; Method B instead recomputes logits from
+        `patch_sim`/`v_patches` with a reweighted attention (see
+        calibration.py). patch_attn/patch_sim/v_patches are all kept for
+        exactly these two downstream uses, not needed for the plain baseline.
         """
-        patch_embeds, grid_h, grid_w, patch_attn = self.encode_image_dense(pixel_values)
+        patch_embeds, grid_h, grid_w, patch_attn, patch_sim, v_patches = self.encode_image_dense(pixel_values)
         logits = patch_embeds @ text_embeds.T
-        return logits, grid_h, grid_w, patch_attn
+        return logits, grid_h, grid_w, patch_attn, patch_sim, v_patches

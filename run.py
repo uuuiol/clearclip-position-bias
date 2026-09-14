@@ -34,7 +34,7 @@ from clearclip.model import ClearCLIPVisualEncoder, ClearCLIPConfig
 from clearclip.datasets import load_dataset
 from clearclip.prompts import get_classes, PROMPT_TEMPLATES
 from clearclip import diagnostics as diag
-from clearclip.calibration import fit_temperature
+from clearclip.calibration import fit_position_smoothing, fit_attention_reweight, PositionSmoothingParams, AttentionReweightParams
 from clearclip.eval import evaluate_split
 
 
@@ -74,17 +74,26 @@ def stage_extract(cfg: dict):
     text_embeds = encoder.encode_text(classes, PROMPT_TEMPLATES)
     transform = image_transform(ds_cfg["image_size"])
 
+    shared_path = cache_dir / "_shared.npz"
+    if not shared_path.exists():
+        shared = encoder.shared_params()
+        shared["text_embeds"] = text_embeds.cpu().numpy().astype(np.float32)
+        np.savez_compressed(shared_path, **shared)
+        print(f"[extract] wrote shared Method-B params -> {shared_path}")
+
     for idx in range(len(dataset)):
         image_id, image, gt = dataset[idx]
         out_path = cache_dir / f"{image_id}.npz"
         if out_path.exists():
             continue
         pixel_values = transform(image).unsqueeze(0)
-        logits, grid_h, grid_w, patch_attn = encoder.dense_logits(pixel_values, text_embeds)
+        logits, grid_h, grid_w, patch_attn, patch_sim, v_patches = encoder.dense_logits(pixel_values, text_embeds)
         np.savez_compressed(
             out_path,
             logits=logits.cpu().numpy().astype(np.float16),
             patch_attn=patch_attn.cpu().numpy().astype(np.float16),
+            patch_sim=patch_sim.cpu().numpy().astype(np.float16),
+            v_patches=v_patches.cpu().numpy().astype(np.float16),
             grid_h=grid_h, grid_w=grid_w,
             gt_h=gt.shape[0], gt_w=gt.shape[1],
         )
@@ -93,13 +102,24 @@ def stage_extract(cfg: dict):
     print(f"[extract] done -> {cache_dir}")
 
 
-def _load_cached_items(cfg: dict, image_ids: set[str] | None = None, load_gt: bool = True):
+def _load_cached_items(
+    cfg: dict,
+    image_ids: set[str] | None = None,
+    load_gt: bool = True,
+    load_attn_extras: bool = False,
+):
+    """load_attn_extras=True also loads patch_sim/v_patches (Method B only —
+    left off by default since diagnose/Method-A don't need them and they
+    roughly double memory per item).
+    """
     cache_dir = Path(cfg["cache"]["dir"])
     ds_cfg = cfg["dataset"]
     dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"]) if load_gt else None
 
     items = []
     for npz_path in sorted(cache_dir.glob("*.npz")):
+        if npz_path.stem == "_shared":
+            continue
         image_id = npz_path.stem
         if image_ids is not None and image_id not in image_ids:
             continue
@@ -110,6 +130,9 @@ def _load_cached_items(cfg: dict, image_ids: set[str] | None = None, load_gt: bo
             "grid_h": int(data["grid_h"]), "grid_w": int(data["grid_w"]),
             "patch_attn": data["patch_attn"].astype(np.float32),
         }
+        if load_attn_extras:
+            item["patch_sim"] = data["patch_sim"].astype(np.float32)
+            item["v_patches"] = data["v_patches"].astype(np.float32)
         if load_gt:
             from PIL import Image
             label_path = dataset.root / "SegmentationClass" / f"{image_id}.png"
@@ -118,13 +141,18 @@ def _load_cached_items(cfg: dict, image_ids: set[str] | None = None, load_gt: bo
     return items
 
 
+def _load_shared(cfg: dict) -> dict:
+    data = np.load(Path(cfg["cache"]["dir"]) / "_shared.npz")
+    return {k: data[k].astype(np.float32) for k in data.files}
+
+
 def stage_diagnose(cfg: dict):
     diag_cfg = cfg["diagnostics"]
     n_bins = diag_cfg["n_bins"]
     items = _load_cached_items(cfg)
     n_classes = len(get_classes(cfg["dataset"]["name"], cfg["dataset"]["include_background"]))
 
-    result = evaluate_split(items, n_classes, n_bins=n_bins, temperature_fn=None)
+    result = evaluate_split(items, n_classes, n_bins=n_bins, logits_fn=None)
     gap, lo, hi = diag.bootstrap_bias_gap(
         result["per_image_correct"], result["per_image_total"],
         n_resamples=diag_cfg["bootstrap_resamples"], seed=diag_cfg["seed"],
@@ -183,17 +211,30 @@ def stage_diagnose(cfg: dict):
 
 def stage_calibrate(cfg: dict):
     ds_cfg, cal_cfg = cfg["dataset"], cfg["calibration"]
+    method = cal_cfg["method"]
     dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"])
     calib_ids, eval_ids = dataset.split_calibration(cal_cfg["calib_split_size"])
-
-    calib_items = _load_cached_items(cfg, image_ids=calib_ids)
     n_classes = len(get_classes(ds_cfg["name"], ds_cfg["include_background"]))
 
-    params, calib_miou = fit_temperature(
-        calib_items, n_classes, cal_cfg["lambda_grid"], cal_cfg["p_grid"],
-    )
-    out = {"lambda": params.lam, "p": params.p, "calib_split_miou": calib_miou,
-           "calib_split_size": len(calib_items)}
+    if method == "A":
+        calib_items = _load_cached_items(cfg, image_ids=calib_ids)
+        params, calib_miou = fit_position_smoothing(
+            calib_items, n_classes, cal_cfg["lambda_grid"], cal_cfg["p_grid"],
+        )
+        out = {"method": "A", "lambda": params.lam, "p": params.p,
+               "calib_split_miou": calib_miou, "calib_split_size": len(calib_items)}
+    elif method == "B":
+        calib_items = _load_cached_items(cfg, image_ids=calib_ids, load_attn_extras=True)
+        shared = _load_shared(cfg)
+        params, calib_miou = fit_attention_reweight(
+            calib_items, shared, n_classes,
+            cal_cfg["beta_grid"], cal_cfg["theta_grid"], cal_cfg["tau_grid"],
+        )
+        out = {"method": "B", "beta": params.beta, "theta": params.theta, "tau": params.tau,
+               "calib_split_miou": calib_miou, "calib_split_size": len(calib_items)}
+    else:
+        raise ValueError(f"calibration.method must be 'A' or 'B', got {method!r}")
+
     out_path = Path("results") / f"{ds_cfg['name']}_calibration_params.json"
     out_path.parent.mkdir(exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2))
@@ -212,12 +253,21 @@ def stage_evaluate(cfg: dict):
         print("[evaluate] no calibration params found — run --stage calibrate first.")
         return
     params_dict = json.loads(params_path.read_text())
-    from clearclip.calibration import TemperatureParams
-    params = TemperatureParams(lam=params_dict["lambda"], p=params_dict["p"])
+    method = params_dict["method"]
 
-    eval_items = _load_cached_items(cfg, image_ids=eval_ids)
-    baseline = evaluate_split(eval_items, n_classes, temperature_fn=None)
-    calibrated = evaluate_split(eval_items, n_classes, temperature_fn=params.fn())
+    if method == "A":
+        params = PositionSmoothingParams(lam=params_dict["lambda"], p=params_dict["p"])
+        eval_items = _load_cached_items(cfg, image_ids=eval_ids)
+        logits_fn = params.fn()
+    elif method == "B":
+        params = AttentionReweightParams(beta=params_dict["beta"], theta=params_dict["theta"], tau=params_dict["tau"])
+        eval_items = _load_cached_items(cfg, image_ids=eval_ids, load_attn_extras=True)
+        logits_fn = params.fn(_load_shared(cfg))
+    else:
+        raise ValueError(f"unknown calibration method in {params_path}: {method!r}")
+
+    baseline = evaluate_split(eval_items, n_classes, logits_fn=None)
+    calibrated = evaluate_split(eval_items, n_classes, logits_fn=logits_fn)
 
     base_gap, base_lo, base_hi = diag.bootstrap_bias_gap(
         baseline["per_image_correct"], baseline["per_image_total"])

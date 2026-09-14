@@ -29,9 +29,17 @@ diagnostics:
 
 calibration:
   method: "A"                 # "A" = position-conditioned temperature scaling, "B" = attention reweighting
-  calib_split_size: 150        # images held out from the val set for fitting lambda/p, excluded from final eval
+  calib_split_size: 150        # images held out from the val set for fitting params, excluded from final eval
+  # Method A grid
   lambda_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
   p_grid: [1, 2, 3]
+  # Method B grid (only used when method: "B"; needs load_attn_extras cache
+  # fields patch_sim/v_patches, present in every cache written after the
+  # Method-B cache-format update — re-run --stage extract if your cache
+  # predates it)
+  beta_grid: [0.0, 0.5, 1.0, 2.0, 4.0]
+  theta_grid: [0.5, 0.6, 0.7, 0.8]
+  tau_grid: [0.5, 1.0, 2.0]
 
 stage: "diagnose"   # one of: extract | diagnose | calibrate | evaluate | all
                     # "extract" requires a GPU (run on Colab); the rest are CPU-only over the cache

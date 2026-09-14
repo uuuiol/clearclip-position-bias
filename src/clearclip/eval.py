@@ -45,11 +45,15 @@ def evaluate_split(
     items: list[dict],
     n_classes: int,
     n_bins: int = 4,
-    temperature_fn=None,
+    logits_fn=None,
 ):
-    """items: list of {"logits", "grid_h", "grid_w", "gt"} for cached images.
-    temperature_fn(logits, r_flat) -> calibrated logits; pass None for the
-    uncalibrated ClearCLIP baseline.
+    """items: list of {"logits", "grid_h", "grid_w", "gt", ...} for cached
+    images (Method B additionally expects "patch_sim"/"v_patches" per item).
+
+    logits_fn(item, r_flat) -> calibrated (n_patches, n_classes) logits.
+    Pass None for the uncalibrated ClearCLIP baseline (uses item["logits"]
+    as-is). Method A's TemperatureParams.fn() and Method B's
+    attention_reweight_fn() both produce a function of this shape.
 
     Returns dict with overall mIoU, per-bin mIoU, and the per-image bin
     pixel-accuracy arrays needed by diagnostics.bootstrap_bias_gap.
@@ -61,11 +65,11 @@ def evaluate_split(
     per_image_correct, per_image_total = [], []
 
     for item in items:
-        logits, grid_h, grid_w, gt = item["logits"], item["grid_h"], item["grid_w"], item["gt"]
+        grid_h, grid_w, gt = item["grid_h"], item["grid_w"], item["gt"]
         r_grid = radial_grid(grid_h, grid_w)
         r_flat = r_grid.reshape(-1)
 
-        cal_logits = temperature_fn(logits, r_flat) if temperature_fn else logits
+        cal_logits = logits_fn(item, r_flat) if logits_fn else item["logits"]
 
         out_h, out_w = gt.shape
         pred = predict_labels(cal_logits, grid_h, grid_w, out_h, out_w)
