@@ -1,0 +1,37 @@
+# Fixed run contract: `python run.py --config config.yaml`
+# Child nodes on the experiment tree edit THIS file (or the modules it points at)
+# on their own branch — the run command itself never changes.
+
+backbone:
+  name: "ViT-B-16"
+  pretrained: "openai"
+  device: "cuda"        # run.py falls back to "cpu" automatically if cuda is unavailable
+
+clearclip:
+  self_attn_mode: "qq"   # ClearCLIP recipe: query-query self-self attention
+  drop_residual: true    # remove the last-block residual connection (primary noise source)
+  drop_ffn: true          # drop the last-block feed-forward network
+
+dataset:
+  name: "voc20"           # first dataset brought up end-to-end; others are stubs, see src/clearclip/datasets.py
+  root: "data/raw/VOCdevkit/VOC2012"
+  split: "val"
+  include_background: false   # false = Table-2-style (20 classes), true = Table-3-style (21, with background)
+  image_size: 336             # patch grid = image_size / 16 = 21x21 for ViT-B/16
+
+cache:
+  dir: "data/cache/voc20"     # patch features + logits + attention maps land here (produced on Colab)
+
+diagnostics:
+  n_bins: 4                   # quartile bins of normalized center-distance r
+  bootstrap_resamples: 1000
+  seed: 0
+
+calibration:
+  method: "A"                 # "A" = position-conditioned temperature scaling, "B" = attention reweighting
+  calib_split_size: 150        # images held out from the val set for fitting lambda/p, excluded from final eval
+  lambda_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
+  p_grid: [1, 2, 3]
+
+stage: "diagnose"   # one of: extract | diagnose | calibrate | evaluate | all
+                    # "extract" requires a GPU (run on Colab); the rest are CPU-only over the cache
