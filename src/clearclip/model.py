@@ -40,8 +40,15 @@ class ClearCLIPVisualEncoder:
         device = cfg.device if (cfg.device == "cpu" or torch.cuda.is_available()) else "cpu"
         self.device = torch.device(device)
 
+        # OpenAI's original CLIP checkpoints were trained with QuickGELU, not
+        # the standard GELU open_clip defaults to for a plain "ViT-B-16" model
+        # name. Silently mismatched activations degrade the whole network,
+        # not just the last block — force it whenever pretrained="openai"
+        # (leave other pretrained tags, e.g. laion2b, alone: those were
+        # actually trained with standard GELU).
         model, _, preprocess = open_clip.create_model_and_transforms(
-            cfg.backbone, pretrained=cfg.pretrained
+            cfg.backbone, pretrained=cfg.pretrained,
+            force_quick_gelu=(cfg.pretrained == "openai"),
         )
         self.tokenizer = open_clip.get_tokenizer(cfg.backbone)
         self.model = model.to(self.device).eval()
