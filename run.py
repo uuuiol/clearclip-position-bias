@@ -59,7 +59,7 @@ def stage_extract(cfg: dict):
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     ds_cfg = cfg["dataset"]
-    dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"])
+    dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"], ds_cfg["include_background"])
     classes = get_classes(ds_cfg["name"], ds_cfg["include_background"])
 
     bb_cfg = cfg["backbone"]
@@ -114,7 +114,10 @@ def _load_cached_items(
     """
     cache_dir = Path(cfg["cache"]["dir"])
     ds_cfg = cfg["dataset"]
-    dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"]) if load_gt else None
+    dataset = (
+        load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"], ds_cfg["include_background"])
+        if load_gt else None
+    )
 
     items = []
     for npz_path in sorted(cache_dir.glob("*.npz")):
@@ -134,9 +137,10 @@ def _load_cached_items(
             item["patch_sim"] = data["patch_sim"].astype(np.float32)
             item["v_patches"] = data["v_patches"].astype(np.float32)
         if load_gt:
-            from PIL import Image
-            label_path = dataset.root / "SegmentationClass" / f"{image_id}.png"
-            item["gt"] = np.array(Image.open(label_path), dtype=np.int64)
+            # NOT a raw PIL read — must go through dataset.load_label so the
+            # background/void remap (datasets.remap_voc_label) is applied
+            # identically here and in VOC20Dataset.__getitem__.
+            item["gt"] = dataset.load_label(image_id)
         items.append(item)
     return items
 
@@ -212,7 +216,7 @@ def stage_diagnose(cfg: dict):
 def stage_calibrate(cfg: dict):
     ds_cfg, cal_cfg = cfg["dataset"], cfg["calibration"]
     method = cal_cfg["method"]
-    dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"])
+    dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"], ds_cfg["include_background"])
     calib_ids, eval_ids = dataset.split_calibration(cal_cfg["calib_split_size"])
     n_classes = len(get_classes(ds_cfg["name"], ds_cfg["include_background"]))
 
@@ -244,7 +248,7 @@ def stage_calibrate(cfg: dict):
 
 def stage_evaluate(cfg: dict):
     ds_cfg, cal_cfg = cfg["dataset"], cfg["calibration"]
-    dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"])
+    dataset = load_dataset(ds_cfg["name"], ds_cfg["root"], ds_cfg["split"], ds_cfg["include_background"])
     _, eval_ids = dataset.split_calibration(cal_cfg["calib_split_size"])
     n_classes = len(get_classes(ds_cfg["name"], ds_cfg["include_background"]))
 
