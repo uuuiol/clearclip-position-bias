@@ -89,6 +89,34 @@ def test_bootstrap_bias_gap_detects_real_gap():
     assert lo > 0.0  # CI should exclude zero -> "GO" in run.py's go/no-go check
 
 
+def test_bootstrap_paired_delta_zero_when_conditions_identical():
+    correct = [np.array([8, 3])] * 10
+    total = [np.array([10, 10])] * 10
+    point, lo, hi = diag.bootstrap_paired_delta(correct, total, correct, total, n_resamples=200, seed=0)
+    assert point == pytest.approx(0.0)
+    assert lo <= 0.0 <= hi
+
+
+def test_bootstrap_paired_delta_detects_consistent_improvement():
+    # baseline: boundary bin (index -1) always wrong; calibrated: always fixed.
+    # Both conditions share identical center-bin (index 0) behavior and
+    # per-image variability, which a paired test should cancel out even
+    # though a naive per-condition bootstrap would call both "noisy".
+    rng = np.random.default_rng(0)
+    n_images = 30
+    center_correct = rng.integers(4, 9, size=n_images)  # noisy but shared
+    base_correct = [np.array([c, 0]) for c in center_correct]
+    cal_correct = [np.array([c, 10]) for c in center_correct]
+    total = [np.array([10, 10])] * n_images
+
+    point, lo, hi = diag.bootstrap_paired_delta(base_correct, total, cal_correct, total, n_resamples=500, seed=0)
+    # gap = acc[0]-acc[-1]; baseline gap ~ center_acc - 0; calibrated gap ~ center_acc - 1
+    # delta = calibrated_gap - baseline_gap = -1.0 always, regardless of the
+    # shared noisy center accuracy -> should be a tight, clearly-negative CI.
+    assert point == pytest.approx(-1.0)
+    assert hi < 0.0
+
+
 def test_attention_centrality_uniform_attention_is_constant():
     n = 5
     r = np.linspace(0, 1, n)

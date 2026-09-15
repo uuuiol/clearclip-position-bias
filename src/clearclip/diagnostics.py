@@ -136,6 +136,59 @@ def bootstrap_bias_gap(
     return float(point), float(lo), float(hi)
 
 
+def bootstrap_paired_delta(
+    baseline_correct: list[np.ndarray],
+    baseline_total: list[np.ndarray],
+    calibrated_correct: list[np.ndarray],
+    calibrated_total: list[np.ndarray],
+    n_resamples: int = 1000,
+    seed: int = 0,
+):
+    """CI on (calibrated_bias_gap - baseline_bias_gap) using a PAIRED
+    bootstrap: each resample draws one set of image indices and applies it to
+    BOTH conditions before taking their difference, rather than differencing
+    two independently-bootstrapped CIs.
+
+    This matters here specifically: baseline and calibrated are the same
+    images scored twice (once uncalibrated, once through Method A/B), so
+    they're correlated measurements. Two separately-bootstrapped marginal
+    CIs can look like they "overlap" even when the paired difference is
+    consistently positive (or negative) on every resample, because the
+    marginal CIs' extra width comes partly from image-to-image variation
+    that's identical in both conditions and cancels out of the paired delta.
+    Comparing marginal CIs is the more conservative (and less informative)
+    check; this is the one that actually answers "does calibration help,
+    net of which images happen to be easy or hard."
+
+    All four `*_correct`/`*_total` args must be per-image (n_bins,) arrays in
+    the SAME image order (true whenever both come from evaluate_split calls
+    over the same `items` list, as run.py's stage_evaluate does).
+    """
+    bc, bt = np.stack(baseline_correct), np.stack(baseline_total)
+    cc, ct = np.stack(calibrated_correct), np.stack(calibrated_total)
+    n_images = bc.shape[0]
+
+    def gap(correct, total, idx):
+        c = correct[idx].sum(axis=0)
+        t = np.maximum(total[idx].sum(axis=0), 1)
+        acc = c / t
+        return acc[0] - acc[-1]
+
+    def delta(idx):
+        return gap(cc, ct, idx) - gap(bc, bt, idx)
+
+    idx_all = np.arange(n_images)
+    point = delta(idx_all)
+
+    rng = np.random.default_rng(seed)
+    boot = np.empty(n_resamples)
+    for i in range(n_resamples):
+        idx = rng.integers(0, n_images, size=n_images)
+        boot[i] = delta(idx)
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    return float(point), float(lo), float(hi)
+
+
 def attention_centrality(patch_attn: np.ndarray, r_flat: np.ndarray) -> np.ndarray:
     """c_i = sum_j A_ij * (1 - r_j) for every query patch i. `patch_attn` is
     (n_patches, n_patches), already head-averaged.

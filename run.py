@@ -278,6 +278,15 @@ def stage_evaluate(cfg: dict):
     cal_gap, cal_lo, cal_hi = diag.bootstrap_bias_gap(
         calibrated["per_image_correct"], calibrated["per_image_total"])
 
+    # Paired bootstrap on the delta itself (see diagnostics.bootstrap_paired_delta
+    # docstring for why this is the test that matters, not eyeballing whether
+    # the two marginal CIs above overlap).
+    delta_point, delta_lo, delta_hi = diag.bootstrap_paired_delta(
+        baseline["per_image_correct"], baseline["per_image_total"],
+        calibrated["per_image_correct"], calibrated["per_image_total"],
+    )
+    delta_significant = delta_lo > 0 or delta_hi < 0
+
     report = {
         "n_eval_images": len(eval_items),
         "params": params_dict,
@@ -287,6 +296,11 @@ def stage_evaluate(cfg: dict):
                        "bias_gap": cal_gap, "bias_gap_ci": [cal_lo, cal_hi]},
         "delta_overall_miou_pp": 100 * (calibrated["overall_miou"] - baseline["overall_miou"]),
         "delta_boundary_bin_miou_pp": 100 * (calibrated["per_bin_miou"][-1] - baseline["per_bin_miou"][-1]),
+        "delta_bias_gap_paired_bootstrap": {
+            "point": delta_point, "ci_low": delta_lo, "ci_high": delta_hi,
+            "significant": delta_significant,
+            "note": "negative delta = calibration SHRANK the center-vs-boundary gap (the intended effect)",
+        },
     }
     out_path = Path("results") / f"{ds_cfg['name']}_final_results.json"
     out_path.write_text(json.dumps(report, indent=2))
