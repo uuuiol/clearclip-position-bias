@@ -75,11 +75,23 @@ class ClearCLIPVisualEncoder:
     @torch.no_grad()
     def _last_block_forward(self, x: torch.Tensor, block):
         """Custom forward for the FINAL resblock only, implementing the
-        ClearCLIP surgery. `x` is (seq_len, batch, width) — open_clip's ViT
-        uses this (L, N, D) layout internally before the final permute.
+        ClearCLIP surgery. `x` is (batch, seq_len, width) — (N, L, D),
+        batch-first, matching open_clip's `nn.MultiheadAttention(...,
+        batch_first=True)` used by every other resblock in this stack.
 
-        Returns (x_visual, attn_weights) where attn_weights is head-averaged,
-        shape (N, L, L) — kept for the Phase-1 attention-centrality diagnostic.
+        CORRECTION: an earlier version of this method (and the caller)
+        assumed the legacy sequence-first (L, N, D) layout and permuted into
+        it before the resblocks loop. With batch_first=True and N=1 (we
+        encode one image at a time), that permute silently produced a valid
+        but wrong tensor — (L, 1, D) — which every *other* resblock's
+        internal attention then read as "L independent length-1 sequences",
+        i.e. no patch ever attended to any other patch except in this last,
+        manually-implemented block. That collapsed dense prediction to
+        near-random (mIoU ~0.001). Fixed by keeping (N, L, D) throughout and
+        deriving N/L in that order below.
+
+        Returns (x_visual, attn_weights_avg, sim_avg, v_merged), all (N, L, L)
+        or (N, L, D) as documented at each return value below.
         """
         ln1_out = block.ln_1(x)
 
@@ -95,15 +107,21 @@ class ClearCLIPVisualEncoder:
         q_w, k_w, v_w = w.chunk(3, dim=0)
         q_b, k_b, v_b = (b.chunk(3, dim=0) if b is not None else (None, None, None))
 
-        q = F.linear(ln1_out, q_w, q_b)
+        q = F.linear(ln1_out, q_w, q_b)  # (N, L, D)
         k = F.linear(ln1_out, k_w, k_b)
         v = F.linear(ln1_out, v_w, v_b)
 
-        L, N, _ = q.shape
-        def reshape_heads(t):
-            return t.reshape(L, N * num_heads, head_dim).transpose(0, 1)  # (N*heads, L, head_dim)
+        N, L, _ = q.shape
 
-        q, k, v = reshape_heads(q), reshape_heads(k), reshape_heads(v)
+        def split_heads(t):
+            # (N, L, D) -> (N, L, heads, head_dim) -> (N*heads, L, head_dim)
+            return t.reshape(N, L, num_heads, head_dim).permute(0, 2, 1, 3).reshape(N * num_heads, L, head_dim)
+
+        def merge_heads(t):
+            # inverse of split_heads: (N*heads, L, head_dim) -> (N, L, D)
+            return t.reshape(N, num_heads, L, head_dim).permute(0, 2, 1, 3).reshape(N, L, embed_dim)
+
+        q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         if self.cfg.self_attn_mode == "qq":
             sim = torch.bmm(q, q.transpose(1, 2))
@@ -115,7 +133,7 @@ class ClearCLIPVisualEncoder:
         sim = sim / math.sqrt(head_dim)
         attn_weights = sim.softmax(dim=-1)
         out = torch.bmm(attn_weights, v)  # (N*heads, L, head_dim)
-        out = out.transpose(0, 1).reshape(L, N, embed_dim)
+        out = merge_heads(out)             # (N, L, D)
         attn_out = F.linear(out, attn.out_proj.weight, attn.out_proj.bias)
 
         if self.cfg.drop_residual:
@@ -142,7 +160,7 @@ class ClearCLIPVisualEncoder:
         # attention matrix to (out = attn_weights' @ v); note it operates in
         # the head-merged space (see calibration.py's Method B docstring for
         # why this is a documented approximation, not an exact per-head redo).
-        v_merged = v.transpose(0, 1).reshape(L, N, embed_dim).transpose(0, 1)
+        v_merged = merge_heads(v)
 
         return x_visual, attn_weights_avg, sim_avg, v_merged
 
@@ -192,12 +210,14 @@ class ClearCLIPVisualEncoder:
         x = visual.patch_dropout(x) if hasattr(visual, "patch_dropout") else x
         x = visual.ln_pre(x)
 
-        x = x.permute(1, 0, 2)  # -> (L, N, D) for resblocks
+        # (N, L, D) throughout — matches open_clip's batch_first=True
+        # resblocks (see _last_block_forward's docstring for the bug this
+        # replaced: permuting to a legacy (L, N, D) layout here silently
+        # broke every patch-to-patch attention except in the last block).
         for block in self.resblocks[:-1]:
             x = block(x)
 
         x_last, attn_weights, sim, v_merged = self._last_block_forward(x, self.resblocks[-1])
-        x_last = x_last.permute(1, 0, 2)  # -> (N, L, D)
 
         patch_tokens = x_last[:, 1:, :]  # drop CLS position, keep spatial patches
         patch_tokens = visual.ln_post(patch_tokens)
