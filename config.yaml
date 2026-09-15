@@ -28,11 +28,20 @@ diagnostics:
   seed: 0
 
 calibration:
-  method: "A"                 # "A" = position-conditioned temperature scaling, "B" = attention reweighting
+  method: "A"                 # "A" = position-conditioned logit smoothing, "B" = attention reweighting
   calib_split_size: 150        # images held out from the val set for fitting params, excluded from final eval
-  # Method A grid
-  lambda_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
+  # Method A grid. lambda=1.0 was confirmed a genuine optimum (not a grid-
+  # boundary artifact) by a 5-seed sweep with lambda up to 5.0; kept modest
+  # here since that's already validated, revisit if kernel="radial" prefers
+  # a different range.
+  lambda_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.5, 2.0]
   p_grid: [1, 2, 3]
+  # kernel="attn" (original, reuses patch_attn — confirmed NOT to reduce
+  # bias_gap despite improving overall mIoU, see calibration.py's module
+  # docstring) vs "radial" (bias-free geometric kernel, the fix being tested).
+  # sigma_grid only matters for kernel="radial".
+  kernel_grid: ["attn", "radial"]
+  sigma_grid: [0.1, 0.2, 0.3, 0.5, 0.8]
   # Method B grid (only used when method: "B"; needs load_attn_extras cache
   # fields patch_sim/v_patches, present in every cache written after the
   # Method-B cache-format update — re-run --stage extract if your cache

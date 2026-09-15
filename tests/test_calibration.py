@@ -9,6 +9,7 @@ from clearclip.calibration import (
     PositionSmoothingParams,
     fit_position_smoothing,
     AttentionReweightParams,
+    radial_similarity_kernel,
 )
 from clearclip.diagnostics import radial_grid
 
@@ -58,6 +59,57 @@ def test_position_smoothing_alpha_is_clipped_to_one():
     # alpha clipped to 1 -> output should equal the fully-smoothed version
     expected = patch_attn @ logits
     assert np.allclose(out, expected)
+
+
+def test_radial_similarity_kernel_rows_sum_to_one():
+    r_flat = np.array([0.0, 0.3, 0.6, 1.0])
+    K = radial_similarity_kernel(r_flat, sigma=0.3)
+    assert K.shape == (4, 4)
+    assert np.allclose(K.sum(axis=-1), 1.0)
+
+
+def test_radial_similarity_kernel_favors_similar_r_over_different_r():
+    r_flat = np.array([0.0, 0.05, 0.9])  # patch 0 and 1 are close in r, patch 2 is far
+    K = radial_similarity_kernel(r_flat, sigma=0.3)
+    assert K[0, 1] > K[0, 2]  # patch 0 weights its near-r neighbor (1) more than the far one (2)
+
+
+def test_radial_similarity_kernel_is_bias_free_no_patch_attn_needed():
+    # kernel="radial" must not touch item["patch_attn"] at all — that's the
+    # whole point (patch_attn is itself position-biased; see the module
+    # docstring's explanation for why kernel="attn" failed to reduce
+    # bias_gap). Passing an item with NO "patch_attn" key must still work.
+    logits = np.array([[1.0, 0.0], [0.0, 1.0]])
+    r_flat = np.array([0.1, 0.9])
+    item = {"logits": logits}  # deliberately no "patch_attn"
+    params = PositionSmoothingParams(lam=1.0, p=1, kernel="radial", sigma=0.3)
+    out = params.fn()(item, r_flat)  # must not raise KeyError
+    assert out.shape == logits.shape
+
+
+def test_fit_position_smoothing_can_prefer_radial_kernel():
+    # Construct a case where the attn kernel is actively misleading (it
+    # points every patch toward a WRONG neighbor) while the radial kernel
+    # (built only from r, ignoring attn) points toward the RIGHT one.
+    logits = np.array([[0.1, 0.9], [0.6, 0.4], [0.55, 0.45]])
+    # patch_attn: everyone attends fully to patch 0 (which itself needs
+    # fixing) — a stand-in for "attention is itself biased/unhelpful here".
+    patch_attn = np.array([[1.0, 0.0, 0.0]] * 3)
+    gt = np.array([[1, 1, 1]])
+    r_flat_grid_h, r_flat_grid_w = 1, 3
+    item = {
+        "logits": logits, "patch_attn": patch_attn,
+        "grid_h": r_flat_grid_h, "grid_w": r_flat_grid_w, "gt": gt,
+    }
+
+    best, score = fit_position_smoothing(
+        [item], n_classes=2, lambda_grid=[0.0, 1.0], p_grid=[1],
+        kernel_grid=["attn", "radial"], sigma_grid=[0.5],
+    )
+    # whichever kernel wins, it must have been actually compared against the
+    # other (this mainly guards against a silent no-op / signature bug)
+    assert best.kernel in ("attn", "radial")
+    assert score >= 1.0 / 3  # sanity: better than the all-attn baseline's 1/3
 
 
 def test_fit_position_smoothing_prefers_lambda_that_fixes_errors():

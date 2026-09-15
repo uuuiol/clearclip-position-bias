@@ -31,6 +31,30 @@ of being pulled toward the interior:
     A'_{ij} = softmax_j( sim_{ij}/tau + beta * 1[r_i>theta] * (1-|r_i-r_j|) )
 This one operates on value vectors before projection, not on final class
 scores, so it does not have the Method-A argmax-invariance problem above.
+
+Method A, round 2 (kernel fix): a 5-seed run showed Method A's mIoU gain
+(+0.3 to +0.7pp, significant in all 5 seeds) does NOT come from shrinking the
+center-vs-boundary bias_gap (paired-bootstrap delta was non-significant in
+all 5 seeds, and point estimates were mostly *positive*, i.e. the gap if
+anything widened slightly). The likely reason: patch_attn — used as the
+smoothing kernel — is itself position-biased (attention_centrality_vs_position
+rho=-0.72 from the Phase-1 diagnostic). So a boundary patch "borrowing from
+its attended neighbors" mostly borrows from center content, not from other
+boundary patches, inheriting the very bias it's meant to correct; center
+patches get a generic denoising benefit from smoothing towards each other,
+which explains the overall mIoU gain without a bias_gap gain.
+
+`PositionSmoothingParams.kernel` fixes this by swapping the smoothing source
+for one built purely from patch geometry, with NO dependence on the model's
+own (biased) attention:
+    kernel="radial":  K_ij ~ exp(-(r_i - r_j)^2 / 2*sigma^2), row-normalized
+                       — patches at a similar distance from the image center
+                       smooth toward each other (mirrors Method B's
+                       (1 - |r_i - r_j|) bias term, but as the entire kernel
+                       here rather than an attention-logit addend).
+    kernel="attn"  :   the original patch_attn-based kernel, kept for direct
+                       comparison in the same grid search.
+Needs no new cache fields or re-extraction — r_flat/logits are already cached.
 """
 
 from __future__ import annotations
@@ -42,16 +66,34 @@ import numpy as np
 from .eval import evaluate_split
 
 
+def radial_similarity_kernel(r_flat: np.ndarray, sigma: float) -> np.ndarray:
+    """Row-normalized Gaussian kernel over |r_i - r_j|. Built purely from
+    patch position — no dependence on patch_attn, so it can't inherit
+    attention's own position bias the way the original Method A kernel does.
+    """
+    diff = r_flat[:, None] - r_flat[None, :]
+    k = np.exp(-(diff ** 2) / (2.0 * sigma ** 2))
+    return k / k.sum(axis=-1, keepdims=True)
+
+
 @dataclass
 class PositionSmoothingParams:
     lam: float
     p: float
+    kernel: str = "attn"    # "attn" (original) or "radial" (bias-free, see module docstring)
+    sigma: float = 0.3      # only used when kernel == "radial"
 
     def fn(self):
-        lam, p = self.lam, self.p
+        lam, p, kernel, sigma = self.lam, self.p, self.kernel, self.sigma
         def _apply(item: dict, r_flat: np.ndarray) -> np.ndarray:
             alpha = np.clip(lam * np.power(r_flat, p), 0.0, 1.0)
-            smoothed = item["patch_attn"] @ item["logits"]  # (n_patches, n_classes)
+            if kernel == "attn":
+                K = item["patch_attn"]
+            elif kernel == "radial":
+                K = radial_similarity_kernel(r_flat, sigma)
+            else:
+                raise ValueError(f"unknown kernel: {kernel!r}")
+            smoothed = K @ item["logits"]  # (n_patches, n_classes)
             return (1.0 - alpha[:, None]) * item["logits"] + alpha[:, None] * smoothed
         return _apply
 
@@ -61,19 +103,28 @@ def fit_position_smoothing(
     n_classes: int,
     lambda_grid: list[float],
     p_grid: list[float],
+    kernel_grid: list[str] = ("attn",),
+    sigma_grid: list[float] = (0.3,),
 ) -> tuple[PositionSmoothingParams, float]:
-    """Grid search (lambda, p) maximizing overall mIoU on the calibration
-    split. Returns (best_params, best_calib_miou).
+    """Grid search (lambda, p, kernel[, sigma]) maximizing overall mIoU on the
+    calibration split — deliberately NOT bias_gap, so that any bias_gap
+    improvement measured afterward on the eval split is an honest downstream
+    check rather than the thing directly optimized for. Returns (best_params,
+    best_calib_miou). sigma is only varied for kernel == "radial" (looping it
+    for "attn" would just re-evaluate the same identical model n times).
     """
     best = None
     best_score = -1.0
-    for lam in lambda_grid:
-        for p in p_grid:
-            params = PositionSmoothingParams(lam=lam, p=p)
-            result = evaluate_split(calib_items, n_classes, logits_fn=params.fn())
-            score = result["overall_miou"]
-            if score > best_score:
-                best_score, best = score, params
+    for kernel in kernel_grid:
+        sigmas = sigma_grid if kernel == "radial" else (sigma_grid[0],)
+        for lam in lambda_grid:
+            for p in p_grid:
+                for sigma in sigmas:
+                    params = PositionSmoothingParams(lam=lam, p=p, kernel=kernel, sigma=sigma)
+                    result = evaluate_split(calib_items, n_classes, logits_fn=params.fn())
+                    score = result["overall_miou"]
+                    if score > best_score:
+                        best_score, best = score, params
     return best, best_score
 
 

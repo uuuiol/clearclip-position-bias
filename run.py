@@ -224,8 +224,11 @@ def stage_calibrate(cfg: dict):
         calib_items = _load_cached_items(cfg, image_ids=calib_ids)
         params, calib_miou = fit_position_smoothing(
             calib_items, n_classes, cal_cfg["lambda_grid"], cal_cfg["p_grid"],
+            kernel_grid=cal_cfg.get("kernel_grid", ["attn"]),
+            sigma_grid=cal_cfg.get("sigma_grid", [0.3]),
         )
         out = {"method": "A", "lambda": params.lam, "p": params.p,
+               "kernel": params.kernel, "sigma": params.sigma,
                "calib_split_miou": calib_miou, "calib_split_size": len(calib_items)}
     elif method == "B":
         calib_items = _load_cached_items(cfg, image_ids=calib_ids, load_attn_extras=True)
@@ -260,7 +263,10 @@ def stage_evaluate(cfg: dict):
     method = params_dict["method"]
 
     if method == "A":
-        params = PositionSmoothingParams(lam=params_dict["lambda"], p=params_dict["p"])
+        params = PositionSmoothingParams(
+            lam=params_dict["lambda"], p=params_dict["p"],
+            kernel=params_dict.get("kernel", "attn"), sigma=params_dict.get("sigma", 0.3),
+        )
         eval_items = _load_cached_items(cfg, image_ids=eval_ids)
         logits_fn = params.fn()
     elif method == "B":
