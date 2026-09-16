@@ -55,6 +55,42 @@ own (biased) attention:
     kernel="attn"  :   the original patch_attn-based kernel, kept for direct
                        comparison in the same grid search.
 Needs no new cache fields or re-extraction — r_flat/logits are already cached.
+
+RESULT: kernel="radial" made bias_gap significantly WORSE in all 5 seeds
+(paired-bootstrap CI entirely positive every time), and grid search always
+picked the narrowest sigma available. Reading together with Method A(attn)'s
+non-significant-but-mostly-positive result and Method B's beta->0 preference:
+all three independently-designed corrections share one property — they all
+correct a patch's score by MIXING IT WITH OTHER PATCHES' scores (attention-
+weighted, radial-weighted, or value-vector-weighted). Mixing/averaging is a
+variance-reduction operation: it cancels INDEPENDENT noise, which is why
+overall mIoU rises (most of an image is spatially coherent, so smoothing
+toward any nearby patch reinforces an already-correct majority). But the
+diagnosed problem is a BIAS — a systematic, reproducible, same-direction
+error at high r — and averaging several instances of the same systematic
+error does not cancel it (radial's own failure mode: boundary patches mixed
+with OTHER boundary patches, which share the same bias, if anything
+reinforces it, matching the observed sign). Bias needs bias-correction, not
+variance-reduction. Method C below is designed for that distinction.
+
+Method C: Radial Logit Adjustment (RLA). Transplants the standard
+class-imbalance "logit adjustment" technique (Menon et al., ICLR 2021 —
+originally: correct a classifier's known train/test class-prior mismatch by
+subtracting log(train_prior/test_prior) from each class's logit) onto the
+r-axis instead of the class-frequency axis. Unlike Methods A/B, this never
+mixes one patch's score with another patch's score at all — it estimates,
+from the calibration split, how much each CLASS is systematically over- or
+under-predicted at each r-bin (a population-level statistic, exactly the
+kind of aggregate, reproducible pattern a "bias" is), and subtracts that
+estimated distortion directly:
+
+    delta_{k,c} = log(true_freq_{k,c} + eps) - log(pred_freq_{k,c} + eps)
+    s'_{i,c}    = s_{i,c} + gamma * delta_{bin(r_i), c}
+
+This is class-differentiated (unlike the original broken temperature-scaling
+idea), so it can change argmax; it needs no cache beyond what's already
+there; and it targets the systematic component the diagnostic actually
+measured, rather than trying to smooth it away.
 """
 
 from __future__ import annotations
@@ -63,6 +99,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .datasets import IGNORE_LABEL
+from .diagnostics import radial_grid, nearest_upsample, quartile_bin_edges
 from .eval import evaluate_split
 
 
@@ -193,4 +231,88 @@ def fit_attention_reweight(
                 score = result["overall_miou"]
                 if score > best_score:
                     best_score, best = score, params
+    return best, best_score
+
+
+def _bin_index(r_flat: np.ndarray, edges: np.ndarray, n_bins: int) -> np.ndarray:
+    return np.clip(np.digitize(r_flat, edges[1:-1]), 0, n_bins - 1)
+
+
+def estimate_radial_class_frequencies(
+    calib_items: list[dict], n_classes: int, n_bins: int, epsilon: float = 1e-3,
+):
+    """For each r-bin k and class c, estimate:
+        pred_freq[k, c] = P(argmax(logits) == c | patch in bin k)     (patch-level)
+        true_freq[k, c] = P(GT == c | pixel in bin k, GT != IGNORE)   (pixel-level)
+    over the whole calib_items set combined (pooled, not per-image — a single
+    image rarely has enough pixels per (bin, class) to estimate this alone).
+    Returns (delta, edges) where delta[k, c] = log(true+eps) - log(pred+eps).
+    """
+    edges = quartile_bin_edges(n_bins)
+    pred_count = np.zeros((n_bins, n_classes))
+    pred_total = np.zeros(n_bins)
+    true_count = np.zeros((n_bins, n_classes))
+    true_total = np.zeros(n_bins)
+
+    for item in calib_items:
+        grid_h, grid_w, gt = item["grid_h"], item["grid_w"], item["gt"]
+        r_grid = radial_grid(grid_h, grid_w)
+        r_flat = r_grid.reshape(-1)
+        patch_bin = _bin_index(r_flat, edges, n_bins)
+
+        pred = item["logits"].argmax(axis=-1)
+        for b in range(n_bins):
+            mask = patch_bin == b
+            pred_total[b] += mask.sum()
+            for c in range(n_classes):
+                pred_count[b, c] += (pred[mask] == c).sum()
+
+        r_pixel = nearest_upsample(r_grid, *gt.shape)
+        pixel_bin = _bin_index(r_pixel, edges, n_bins)
+        valid = gt != IGNORE_LABEL
+        for b in range(n_bins):
+            mask = valid & (pixel_bin == b)
+            true_total[b] += mask.sum()
+            for c in range(n_classes):
+                true_count[b, c] += (gt[mask] == c).sum()
+
+    pred_freq = pred_count / np.maximum(pred_total[:, None], 1)
+    true_freq = true_count / np.maximum(true_total[:, None], 1)
+    delta = np.log(true_freq + epsilon) - np.log(pred_freq + epsilon)
+    return delta, edges
+
+
+@dataclass
+class RadialLogitAdjustmentParams:
+    delta: np.ndarray   # (n_bins, n_classes), from estimate_radial_class_frequencies
+    edges: np.ndarray   # bin edges used to fit `delta` — must reuse the same ones at eval time
+    gamma: float
+
+    def fn(self):
+        delta, edges, gamma, n_bins = self.delta, self.edges, self.gamma, self.delta.shape[0]
+        def _apply(item: dict, r_flat: np.ndarray) -> np.ndarray:
+            bin_idx = _bin_index(r_flat, edges, n_bins)
+            return item["logits"] + gamma * delta[bin_idx]
+        return _apply
+
+
+def fit_radial_logit_adjustment(
+    calib_items: list[dict],
+    n_classes: int,
+    n_bins: int,
+    gamma_grid: list[float],
+) -> tuple[RadialLogitAdjustmentParams, float]:
+    """Estimate delta once from calib_items (no gradient descent — a closed-
+    form frequency count), then grid-search only gamma (correction strength)
+    for calib-split mIoU. Returns (best_params, best_calib_miou).
+    """
+    delta, edges = estimate_radial_class_frequencies(calib_items, n_classes, n_bins)
+    best = None
+    best_score = -1.0
+    for gamma in gamma_grid:
+        params = RadialLogitAdjustmentParams(delta=delta, edges=edges, gamma=gamma)
+        result = evaluate_split(calib_items, n_classes, logits_fn=params.fn())
+        score = result["overall_miou"]
+        if score > best_score:
+            best_score, best = score, params
     return best, best_score

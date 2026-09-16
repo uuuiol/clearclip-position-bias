@@ -34,7 +34,10 @@ from clearclip.model import ClearCLIPVisualEncoder, ClearCLIPConfig
 from clearclip.datasets import load_dataset
 from clearclip.prompts import get_classes, PROMPT_TEMPLATES
 from clearclip import diagnostics as diag
-from clearclip.calibration import fit_position_smoothing, fit_attention_reweight, PositionSmoothingParams, AttentionReweightParams
+from clearclip.calibration import (
+    fit_position_smoothing, fit_attention_reweight, fit_radial_logit_adjustment,
+    PositionSmoothingParams, AttentionReweightParams, RadialLogitAdjustmentParams,
+)
 from clearclip.eval import evaluate_split
 
 
@@ -239,8 +242,16 @@ def stage_calibrate(cfg: dict):
         )
         out = {"method": "B", "beta": params.beta, "theta": params.theta, "tau": params.tau,
                "calib_split_miou": calib_miou, "calib_split_size": len(calib_items)}
+    elif method == "C":
+        calib_items = _load_cached_items(cfg, image_ids=calib_ids)
+        params, calib_miou = fit_radial_logit_adjustment(
+            calib_items, n_classes, cfg["diagnostics"]["n_bins"], cal_cfg["gamma_grid"],
+        )
+        out = {"method": "C", "gamma": params.gamma,
+               "delta": params.delta.tolist(), "edges": params.edges.tolist(),
+               "calib_split_miou": calib_miou, "calib_split_size": len(calib_items)}
     else:
-        raise ValueError(f"calibration.method must be 'A' or 'B', got {method!r}")
+        raise ValueError(f"calibration.method must be 'A', 'B', or 'C', got {method!r}")
 
     out_path = Path("results") / f"{ds_cfg['name']}_calibration_params.json"
     out_path.parent.mkdir(exist_ok=True)
@@ -273,6 +284,13 @@ def stage_evaluate(cfg: dict):
         params = AttentionReweightParams(beta=params_dict["beta"], theta=params_dict["theta"], tau=params_dict["tau"])
         eval_items = _load_cached_items(cfg, image_ids=eval_ids, load_attn_extras=True)
         logits_fn = params.fn(_load_shared(cfg))
+    elif method == "C":
+        params = RadialLogitAdjustmentParams(
+            delta=np.array(params_dict["delta"]), edges=np.array(params_dict["edges"]),
+            gamma=params_dict["gamma"],
+        )
+        eval_items = _load_cached_items(cfg, image_ids=eval_ids)
+        logits_fn = params.fn()
     else:
         raise ValueError(f"unknown calibration method in {params_path}: {method!r}")
 

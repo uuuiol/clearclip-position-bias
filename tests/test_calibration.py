@@ -10,6 +10,9 @@ from clearclip.calibration import (
     fit_position_smoothing,
     AttentionReweightParams,
     radial_similarity_kernel,
+    RadialLogitAdjustmentParams,
+    estimate_radial_class_frequencies,
+    fit_radial_logit_adjustment,
 )
 from clearclip.diagnostics import radial_grid
 
@@ -184,3 +187,75 @@ def test_attention_reweight_beta_zero_matches_plain_softmax_attention():
     proj = normed / np.linalg.norm(normed, axis=-1, keepdims=True)
     expected = proj @ shared["text_embeds"].T
     assert np.allclose(logits, expected, atol=1e-4)
+
+
+def _make_grid_item(n_classes=2, always_predict=0):
+    """A 3x3 patch grid (radial_grid gives one true-center patch at r=0 and
+    eight edge/corner patches all at r>=0.707). GT: the center patch is
+    correctly `always_predict`; the other eight are secretly class
+    `1 - always_predict` while every patch's logits argmax to
+    `always_predict` — i.e. the model is systematically wrong everywhere
+    except dead-center, the exact shape of a *bias* rather than noise.
+    """
+    logits = np.zeros((9, n_classes), dtype=np.float64)
+    logits[:, always_predict] = 5.0
+    logits[:, 1 - always_predict] = -5.0
+    gt = np.full((3, 3), 1 - always_predict, dtype=np.int64)
+    gt[1, 1] = always_predict  # center patch (flattened index 4) is correct
+    return {"logits": logits, "grid_h": 3, "grid_w": 3, "gt": gt}
+
+
+def test_estimate_radial_class_frequencies_matches_hand_computed_bias():
+    item = _make_grid_item(n_classes=2, always_predict=0)
+    delta, edges = estimate_radial_class_frequencies([item], n_classes=2, n_bins=2)
+    assert delta.shape == (2, 2)
+    # bin 0 (center, r=0): 1 patch, correctly predicts class 0 everywhere ->
+    # pred_freq == true_freq -> ~0 correction needed.
+    assert delta[0, 0] == pytest.approx(0.0, abs=1e-6)
+    assert delta[0, 1] == pytest.approx(0.0, abs=1e-6)
+    # bin 1 (edges+corners, r>=0.707): always predicts class 0 but truth is
+    # always class 1 -> class 0 should get a large NEGATIVE correction
+    # (over-predicted) and class 1 a large POSITIVE one (under-predicted).
+    assert delta[1, 0] < -5.0
+    assert delta[1, 1] > 5.0
+    assert delta[1, 0] == pytest.approx(-delta[1, 1], abs=1e-6)  # log(eps) vs -log(eps), symmetric here
+
+
+def test_radial_logit_adjustment_gamma_zero_is_identity():
+    item = _make_grid_item()
+    delta, edges = estimate_radial_class_frequencies([item], n_classes=2, n_bins=2)
+    params = RadialLogitAdjustmentParams(delta=delta, edges=edges, gamma=0.0)
+    r_flat = radial_grid(3, 3).reshape(-1)
+    out = params.fn()(item, r_flat)
+    assert np.allclose(out, item["logits"])
+
+
+def test_radial_logit_adjustment_can_flip_argmax_where_smoothing_could_not():
+    # This is the case Method A/B structurally cannot fix (systematic, not
+    # random, error at every non-center patch) — Method C should fix it,
+    # since it corrects a class-specific population statistic rather than
+    # mixing patches together.
+    item = _make_grid_item(n_classes=2, always_predict=0)
+    delta, edges = estimate_radial_class_frequencies([item], n_classes=2, n_bins=2)
+    r_flat = radial_grid(3, 3).reshape(-1)
+
+    params = RadialLogitAdjustmentParams(delta=delta, edges=edges, gamma=1.0)
+    out = params.fn()(item, r_flat)
+    pred = out.argmax(axis=-1)
+    # every patch should now predict its TRUE class: center=0, the rest=1
+    assert pred[4] == 0
+    assert (pred[np.arange(9) != 4] == 1).all()
+
+
+def test_fit_radial_logit_adjustment_picks_a_gamma_that_fixes_the_bias():
+    item = _make_grid_item(n_classes=2, always_predict=0)
+    best, score = fit_radial_logit_adjustment(
+        [item], n_classes=2, n_bins=2, gamma_grid=[0.0, 0.5, 1.0, 2.0],
+    )
+    # gamma needs to exceed ~0.724 for the correction to overcome the +10
+    # logit margin (see test_radial_logit_adjustment_can_flip_argmax's math);
+    # 0.0 and 0.5 both leave every non-center patch wrong (mIoU ~0.056), while
+    # 1.0 and 2.0 both flip everything to correct (mIoU 1.0) — ties broken
+    # toward the first-encountered, so 1.0 should win over 2.0.
+    assert best.gamma == pytest.approx(1.0)
+    assert score == pytest.approx(1.0)  # fully correct predictions everywhere -> perfect mIoU
